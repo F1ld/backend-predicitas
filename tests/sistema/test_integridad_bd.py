@@ -51,5 +51,6 @@ def test_auditoria_es_solo_insercion(db):
     db.add(evento)
     db.flush()
     evento.accion = "UPDATE"
+    # RNF-009 (D-015): lo rechaza el permiso de predicitas_app (T-011) o el trigger; ambos son DBAPIError.
     with pytest.raises(DBAPIError):
         db.flush()

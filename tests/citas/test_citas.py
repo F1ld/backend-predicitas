@@ -55,6 +55,8 @@ def test_recepcion_cambia_estado_y_queda_historial(client, usuarios, db):
     # ATENDIDA es un estado final: otro cambio se rechaza
     r2 = client.post(f"/citas/{cita.id_cita}/estado", headers=h, json={"estado_nuevo": "CANCELADA"})
     assert r2.status_code == 409
+    assert r2.json()["error"]["codigo"] == "TRANSICION_INVALIDA"
+    assert r2.json()["error"]["campos"] == {}
 
 
 def test_tecnico_ia_puede_leer_pero_no_modificar(client, usuarios, db):
@@ -64,6 +66,7 @@ def test_tecnico_ia_puede_leer_pero_no_modificar(client, usuarios, db):
     assert client.get(f"/citas/{cita.id_cita}", headers=h).status_code == 200
     r = client.post(f"/citas/{cita.id_cita}/estado", headers=h, json={"estado_nuevo": "CONFIRMADA"})
     assert r.status_code == 403
+    assert r.json()["error"]["codigo"] == "SIN_PERMISO"
 
 
 def test_no_se_puede_liberar_manualmente(client, usuarios, db):
@@ -72,3 +75,5 @@ def test_no_se_puede_liberar_manualmente(client, usuarios, db):
     h = cabecera(client, usuarios["RECEPCION"])
     r = client.post(f"/citas/{cita.id_cita}/estado", headers=h, json={"estado_nuevo": "LIBERADA"})
     assert r.status_code == 422
+    assert r.json()["error"]["codigo"] == "VALIDACION"
+    assert "estado_nuevo" in r.json()["error"]["campos"]

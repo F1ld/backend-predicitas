@@ -11,8 +11,9 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+# Alembic usa el rol dueño del esquema (DATABASE_URL_MIGRACIONES); si no está definida, DATABASE_URL (D-015).
 # El % se duplica porque configparser lo interpreta como interpolación.
-config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))
+config.set_main_option("sqlalchemy.url", get_settings().url_migraciones.replace("%", "%%"))
 target_metadata = Base.metadata
 
 
