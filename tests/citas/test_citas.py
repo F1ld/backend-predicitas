@@ -41,7 +41,8 @@ def test_reimportar_lo_mismo_rechaza_todo_como_duplicado(db):
     assert (r.aceptadas, r.rechazadas) == (0, 1)
 
 
-def test_recepcion_cambia_estado_y_queda_historial(client, usuarios, db):
+def test_recepcion_cambia_estado_y_queda_historial(client, usuarios, db, fijar_reloj):
+    fijar_reloj()  # el día de la cita: el desenlace ya no es anticipado (F-06)
     _importar(db, [REGISTRO])
     cita = db.scalar(select(Cita).where(Cita.id_cita_externa == "CIT-TST-000001"))
     h = cabecera(client, usuarios["RECEPCION"])
