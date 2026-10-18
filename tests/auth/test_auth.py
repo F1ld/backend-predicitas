@@ -28,10 +28,10 @@ def test_endpoint_protegido_sin_token_responde_401(client):
     assert r.headers["WWW-Authenticate"] == "Bearer"
 
 
-def test_token_invalido_responde_401_con_formato_unico(client):
+def test_token_invalido_responde_401_sesion_invalida(client):
     r = client.get("/citas", headers={"Authorization": "Bearer no-es-un-jwt"})
     assert r.status_code == 401
-    assert r.json()["error"]["codigo"] == "NO_AUTENTICADO"
+    assert r.json()["error"]["codigo"] == "SESION_INVALIDA"  # F-02, D-010
 
 
 def test_usuario_inactivo_no_puede_entrar(client, usuarios, db):
