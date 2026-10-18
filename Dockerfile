@@ -4,7 +4,10 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    # /app no es escribible por el usuario de la API: la cobertura y la caché de pytest van a /tmp.
+    COVERAGE_FILE=/tmp/.coverage \
+    PYTEST_ADDOPTS="-o cache_dir=/tmp/.pytest_cache"
 
 WORKDIR /app
 
