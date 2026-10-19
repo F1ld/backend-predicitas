@@ -24,7 +24,7 @@ Hay **dos barreras**: los privilegios (lo que el rol puede pedir) y los triggers
 La contraseña nunca va en el repo: sale de `APP_DB_PASSWORD` en tu `.env`.
 
 - **Con Docker:** `db/init/01_rol_app.sh` se monta en `/docker-entrypoint-initdb.d` y crea el rol la **primera vez** que se inicia el volumen de PostgreSQL. Si el volumen ya existía, no se ejecuta: usa la opción sin Docker o borra el volumen (`docker compose down -v`, pierdes los datos locales).
-- **Sin Docker (con `.venv`), desde `backend/`:**
+- **Sin Docker (con `.venv`), desde la carpeta raíz del backend:**
   ```bash
   python -m scripts.crear_rol_app
   ```
