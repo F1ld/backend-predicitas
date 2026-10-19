@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from app.core.dominio import CANALES_CONTACTO, RESPUESTAS_PACIENTE
 from app.modules.citas.schemas import CupoOut, RiesgoResumen  # formas de modulo-02 y modulo-06
@@ -51,13 +51,14 @@ class PaginaElegiblesOut(BaseModel):
 
 
 class IntervencionIn(BaseModel):
-    """M05-E02. consentimiento_confirmado debe ser true literal (RN13): se valida en el servicio
-    para responder CONSENTIMIENTO_REQUERIDO en lugar de VALIDACION."""
+    """M05-E02 (RF-063, RN13, D-024). consentimiento_confirmado solo admite el booleano JSON literal:
+    StrictBool rechaza 1, "true", "yes", 0 o "false" con 422 VALIDACION (sin coerción). La ausencia,
+    null y false llegan al servicio, que responde 422 CONSENTIMIENTO_REQUERIDO si no es true."""
 
     id_cita: int
     canal_contacto: Literal[CANALES_CONTACTO]  # type: ignore[valid-type]
     plantilla_mensaje: str = Field(min_length=1, max_length=100)
-    consentimiento_confirmado: bool
+    consentimiento_confirmado: StrictBool | None = None
 
 
 class EstadoEnvioIn(BaseModel):

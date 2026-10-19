@@ -117,7 +117,7 @@ def plantillas() -> list[PlantillaOut]:
 def crear(db: Session, datos: IntervencionIn, usuario: Usuario, ip: str, ahora: datetime,
           modo_sombra: bool) -> IntervencionOut:
     """M05-E02 (RF-058, RF-063, RF-066, RN07, RN13)."""
-    if datos.consentimiento_confirmado is not True:
+    if datos.consentimiento_confirmado is not True:  # false, null o ausente (D-024)
         raise Validacion("Debe confirmar que el paciente tiene consentimiento para comunicaciones",
                          codigo="CONSENTIMIENTO_REQUERIDO",
                          campos={"consentimiento_confirmado": "Debe ser true"})

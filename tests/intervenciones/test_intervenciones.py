@@ -11,6 +11,7 @@ from app.main import app
 from app.modules.auditoria.models import AuditoriaEvento
 from app.modules.citas.models import Cita, HistorialEstadoCita
 from app.modules.intervenciones import reglas
+from app.modules.intervenciones.models import Intervencion
 from app.modules.intervenciones.router import modo_sombra
 from app.modules.lista_espera.models import CupoLiberado
 from tests.conftest import cabecera
@@ -120,6 +121,40 @@ def test_crear_validaciones(client, h, db, cuerpo, campo):
     cita = crear_cita(db)
     r = client.post("/intervenciones", headers=h, json={**NUEVA, "id_cita": cita.id_cita, **cuerpo})
     assert r.status_code == 422 and _codigo(r) == "VALIDACION" and campo in r.json()["error"]["campos"]
+
+
+def _contar(db):
+    return (db.query(Intervencion).count(), len(_eventos(db, "CREATE")))
+
+
+_SIN = object()  # marca «campo ausente»
+
+
+@pytest.mark.parametrize(("valor", "estado", "codigo"), [
+    (1, 422, "VALIDACION"), ("true", 422, "VALIDACION"), ("yes", 422, "VALIDACION"), ("1", 422, "VALIDACION"),
+    (_SIN, 422, "CONSENTIMIENTO_REQUERIDO"), (None, 422, "CONSENTIMIENTO_REQUERIDO"),
+    (False, 422, "CONSENTIMIENTO_REQUERIDO"),
+    (0, 422, "VALIDACION"), ("false", 422, "VALIDACION"),
+    (True, 201, None),
+])
+def test_consentimiento_estricto(client, h, db, valor, estado, codigo):
+    """RF-063, RN13, D-024 (QA-052-01 y QA-052-02): solo el true literal crea la intervención."""
+    cita = crear_cita(db)
+    cuerpo = {k: v for k, v in NUEVA.items() if k != "consentimiento_confirmado"}
+    cuerpo["id_cita"] = cita.id_cita
+    if valor is not _SIN:
+        cuerpo["consentimiento_confirmado"] = valor
+    antes = _contar(db)
+    r = client.post("/intervenciones", headers=h, json=cuerpo)
+    assert r.status_code == estado, r.text
+    if estado == 201:
+        assert r.json()["estado_intervencion"] == "PENDIENTE"
+        assert _contar(db) == (antes[0] + 1, antes[1] + 1)
+        return
+    error = r.json()["error"]
+    assert error["codigo"] == codigo and "consentimiento_confirmado" in error["campos"]
+    assert "Traceback" not in r.text and "pydantic" not in r.text.lower()
+    assert _contar(db) == antes  # ningún 422 crea intervención ni CREATE
 
 
 def test_crear_404_y_403(client, usuarios, h):
