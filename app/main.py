@@ -1,35 +1,28 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+"""Punto de entrada de la API PrediCitas CRP.
+
+- Los routers se registran solos desde app/modules/*/router.py (app/core/ranuras.py).
+- Todos los errores salen con la forma {"error": {"codigo", "mensaje", "campos"}} (D-017).
+- Cabeceras de seguridad en cada respuesta (app/core/manejadores.py).
+"""
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import app.core.models  # noqa: F401  (registra todos los modelos)
-from app.core.errores import ErrorDeNegocio
-from app.modules.auth.router import router as auth_router
-from app.modules.citas.router import router as citas_router
-
-ORIGENES_PERMITIDOS = [
-       "http://localhost:5173",
-       "http://127.0.0.1:5173",
-   ]
+from app.core import manejadores
+from app.core.config import get_settings
+from app.core.ranuras import registrar_routers
 
 app = FastAPI(title="PrediCitas CRP API", version="0.1.0")
 
 app.add_middleware(
-       CORSMiddleware,
-       allow_origins=ORIGENES_PERMITIDOS,
-       allow_credentials=False,   # el token viaja en el header Authorization, no en cookies
-       allow_methods=["*"],
-       allow_headers=["*"],
-   )
-
-@app.exception_handler(ErrorDeNegocio)
-async def manejar_error_de_negocio(_: Request, exc: ErrorDeNegocio):
-    cabeceras = {"WWW-Authenticate": "Bearer"} if exc.codigo_http == 401 else None
-    return JSONResponse(status_code=exc.codigo_http, content={"detalle": exc.mensaje}, headers=cabeceras)
-
-
-app.include_router(auth_router)
-app.include_router(citas_router)
+    CORSMiddleware,
+    allow_origins=get_settings().lista_cors_origenes,
+    allow_credentials=False,  # el token viaja en el header Authorization, no en cookies
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+manejadores.instalar(app)
+registrar_routers(app)
 
 
 @app.get("/health", tags=["sistema"])

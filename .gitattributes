@@ -1,0 +1,10 @@
+# Normaliza finales de línea en el repositorio
+* text=auto
+
+# Lo que se ejecuta dentro de contenedores Linux debe quedar con LF
+*.sh text eol=lf
+Dockerfile text eol=lf
+
+# Binarios
+*.png binary
+*.xlsx binary
