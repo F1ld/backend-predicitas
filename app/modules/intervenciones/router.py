@@ -1,157 +1,75 @@
-from datetime import date, datetime
-from typing import Literal
-
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
 from app.core.database import get_db
-from app.core.dominio import (CANALES_CONTACTO, ESPECIALIDADES, ESTADOS_INTERVENCION, NIVELES_RIESGO,
-                              RESPUESTAS_PACIENTE)
 from app.core.http import ip_cliente
 from app.modules.auth.dependencies import requiere_roles
 from app.modules.auth.models import Usuario
-from app.modules.citas.router import reloj  # mismo reloj inyectable que M02
-from app.modules.intervenciones import service
-from app.modules.intervenciones.schemas import (CupoOut, EstadoEnvioIn, IntervencionIn, IntervencionOut,
-                                                LiberarIn, PaginaElegiblesOut, PaginaIntervencionesOut,
-                                                PlantillaOut, Rep02Out, RespuestaIn)
+from app.modules.intervenciones import repository, service
+from app.modules.intervenciones.schemas import (
+    BandejaIntervencionesOut,
+    IntervencionCreateIn,
+    IntervencionOut,
+    IntervencionRespuestaIn,
+)
 
-# Sin prefijo: el módulo expone /intervenciones y /reportes/rep-02 (contratos/modulo-05.json).
 router = APIRouter(tags=["intervenciones"])
 
-LECTORES = ("ADMINISTRADOR", "RECEPCION", "TECNICO_IA")
-ESCRITORES = ("ADMINISTRADOR", "RECEPCION")
-
-Especialidad = Literal[ESPECIALIDADES]  # type: ignore[valid-type]
+ROLES_LECTURA = ("ADMINISTRADOR", "RECEPCION", "TECNICO_IA")
+ROLES_OPERACION = ("ADMINISTRADOR", "RECEPCION")
 
 
-def modo_sombra() -> bool:
-    """INTERVENCION_MODO_SOMBRA (Plan de Desarrollo §7). Inyectable en las pruebas."""
-    return get_settings().intervencion_modo_sombra
-
-
-@router.get("/intervenciones/elegibles", response_model=PaginaElegiblesOut)
-def elegibles(
-    desde: date | None = None,
-    hasta: date | None = None,
-    especialidad: Especialidad | None = None,
-    nivel_riesgo: Literal["ALTO", "MEDIO"] | None = None,
-    limite: int = Query(default=50, ge=1, le=200),
-    desplazamiento: int = Query(default=0, ge=0),
-    _: Usuario = Depends(requiere_roles(*ESCRITORES)),
+@router.get("/intervenciones", response_model=BandejaIntervencionesOut)
+def listar_intervenciones(
+    nivel_riesgo: str | None = None,
+    especialidad: str | None = None,
+    estado_intervencion: str | None = None,
+    canal_contacto: str | None = None,
+    _: Usuario = Depends(requiere_roles(*ROLES_LECTURA)),
     db: Session = Depends(get_db),
-    ahora: datetime = Depends(reloj),
 ):
-    """M05-E01 (RF-057)."""
-    return service.elegibles(db, ahora=ahora, desde=desde, hasta=hasta, especialidad=especialidad,
-                             nivel_riesgo=nivel_riesgo, limite=limite, desplazamiento=desplazamiento)
+    return service.listar_bandeja_intervenciones(
+        db,
+        nivel_riesgo=nivel_riesgo,
+        especialidad=especialidad,
+        estado_intervencion=estado_intervencion,
+        canal_contacto=canal_contacto,
+    )
 
 
-@router.get("/intervenciones/plantillas", response_model=list[PlantillaOut])  # antes de /{id}
-def plantillas(_: Usuario = Depends(requiere_roles(*ESCRITORES))):
-    """M05-E09."""
-    return service.plantillas()
+@router.get("/citas/{id_cita}/intervenciones", response_model=list[IntervencionOut])
+def listar_intervenciones_de_cita(
+    id_cita: int,
+    _: Usuario = Depends(requiere_roles(*ROLES_LECTURA)),
+    db: Session = Depends(get_db),
+):
+    return [IntervencionOut.model_validate(i) for i in repository.listar_por_cita(db, id_cita)]
 
 
-@router.post("/intervenciones", response_model=IntervencionOut, status_code=201)
-def crear(
-    datos: IntervencionIn,
+@router.post("/citas/{id_cita}/intervenciones", response_model=IntervencionOut)
+def crear_intervencion(
+    id_cita: int,
+    datos: IntervencionCreateIn,
     request: Request,
-    usuario: Usuario = Depends(requiere_roles(*ESCRITORES)),
-    db: Session = Depends(get_db),
-    ahora: datetime = Depends(reloj),
-    sombra: bool = Depends(modo_sombra),
-):
-    """M05-E02 (RF-058, RF-063)."""
-    return service.crear(db, datos, usuario, ip_cliente(request), ahora, sombra)
-
-
-@router.get("/intervenciones", response_model=PaginaIntervencionesOut)
-def listar(
-    id_cita: int | None = None,
-    estado_intervencion: Literal[ESTADOS_INTERVENCION] | None = None,  # type: ignore[valid-type]
-    canal_contacto: Literal[CANALES_CONTACTO] | None = None,  # type: ignore[valid-type]
-    respuesta_paciente: Literal[RESPUESTAS_PACIENTE] | None = None,  # type: ignore[valid-type]
-    desde: date | None = None,
-    hasta: date | None = None,
-    limite: int = Query(default=50, ge=1, le=200),
-    desplazamiento: int = Query(default=0, ge=0),
-    _: Usuario = Depends(requiere_roles(*LECTORES)),
+    usuario: Usuario = Depends(requiere_roles(*ROLES_OPERACION)),
     db: Session = Depends(get_db),
 ):
-    """M05-E03."""
-    return service.listar(db, id_cita=id_cita, estado=estado_intervencion, canal=canal_contacto,
-                          respuesta=respuesta_paciente, desde=desde, hasta=hasta,
-                          limite=limite, desplazamiento=desplazamiento)
+    return service.crear_intervencion(db, id_cita, datos, usuario=usuario, ip=ip_cliente(request))
 
 
-@router.get("/intervenciones/{id_intervencion}", response_model=IntervencionOut)
-def detalle(id_intervencion: int, _: Usuario = Depends(requiere_roles(*LECTORES)), db: Session = Depends(get_db)):
-    """M05-E04."""
-    return service.detalle(db, id_intervencion)
-
-
-@router.post("/intervenciones/{id_intervencion}/estado", response_model=IntervencionOut)
-def cambiar_estado(
+@router.patch("/intervenciones/{id_intervencion}", response_model=IntervencionOut)
+def registrar_respuesta(
     id_intervencion: int,
-    datos: EstadoEnvioIn,
+    datos: IntervencionRespuestaIn,
     request: Request,
-    usuario: Usuario = Depends(requiere_roles(*ESCRITORES)),
-    db: Session = Depends(get_db),
-    ahora: datetime = Depends(reloj),
-):
-    """M05-E05 (RF-059, RF-061)."""
-    return service.cambiar_estado(db, id_intervencion, datos.estado_intervencion, usuario, ip_cliente(request), ahora)
-
-
-@router.post("/intervenciones/{id_intervencion}/respuesta", response_model=IntervencionOut)
-def respuesta(
-    id_intervencion: int,
-    datos: RespuestaIn,
-    request: Request,
-    usuario: Usuario = Depends(requiere_roles(*ESCRITORES)),
-    db: Session = Depends(get_db),
-    ahora: datetime = Depends(reloj),
-):
-    """M05-E06 (RF-062, RF-064, RF-067)."""
-    return service.responder_intervencion(db, id_intervencion, datos.respuesta_paciente, datos.optout,
-                                          usuario, ip_cliente(request), ahora)
-
-
-@router.post("/intervenciones/{id_intervencion}/optout", response_model=IntervencionOut)
-def optout(id_intervencion: int, request: Request, usuario: Usuario = Depends(requiere_roles(*ESCRITORES)),
-           db: Session = Depends(get_db)):
-    """M05-E07 (RF-064)."""
-    return service.registrar_optout(db, id_intervencion, usuario, ip_cliente(request))
-
-
-@router.post("/intervenciones/{id_intervencion}/liberar-cupo", response_model=CupoOut, status_code=201)
-def liberar_cupo(
-    id_intervencion: int,
-    request: Request,
-    datos: LiberarIn | None = None,
-    usuario: Usuario = Depends(requiere_roles(*ESCRITORES)),
-    db: Session = Depends(get_db),
-    ahora: datetime = Depends(reloj),
-):
-    """M05-E08 (RF-068, RN04)."""
-    return service.liberar_cupo(db, id_intervencion, datos.motivo if datos else None, usuario,
-                                ip_cliente(request), ahora)
-
-
-@router.get("/reportes/rep-02", response_model=Rep02Out)
-def rep02(
-    request: Request,
-    desde: date | None = None,
-    hasta: date | None = None,
-    canal_contacto: Literal[CANALES_CONTACTO] | None = None,  # type: ignore[valid-type]
-    nivel_riesgo: Literal[NIVELES_RIESGO] | None = None,  # type: ignore[valid-type]
-    especialidad: Especialidad | None = None,
-    formato: str = "json",
-    usuario: Usuario = Depends(requiere_roles(*ESCRITORES)),
+    usuario: Usuario = Depends(requiere_roles(*ROLES_OPERACION)),
     db: Session = Depends(get_db),
 ):
-    """M05-E10 (REP-02): json, csv o xlsx."""
-    return service.exportar_rep02(db, formato, usuario, ip_cliente(request), desde=desde, hasta=hasta,
-                                  canal=canal_contacto, nivel_riesgo=nivel_riesgo, especialidad=especialidad)
+    return service.registrar_respuesta_intervencion(
+        db,
+        id_intervencion,
+        datos,
+        usuario=usuario,
+        ip=ip_cliente(request),
+    )
+

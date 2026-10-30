@@ -1,84 +1,84 @@
-"""Esquemas de M09 (contratos/modulo-09.json → tipos)."""
-from datetime import date, datetime, timedelta
-from typing import Literal
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, ValidationInfo, field_serializer, field_validator
-
-Especialidad = Literal["CARDIOLOGIA", "TRAUMATOLOGIA", "PEDIATRIA"]
-NivelRiesgo = Literal["BAJO", "MEDIO", "ALTO"]
-MAX_DIAS_LOTE = 14
+from pydantic import BaseModel, ConfigDict
 
 
-class PrediccionOut(BaseModel):
+class PrediccionIAOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id_prediccion: int
     id_cita: int
     version_modelo: str
-    probabilidad_no_show: float
+    probabilidad_no_show: Decimal
     nivel_riesgo: str
-    umbral_aplicado: float
-    features_snapshot: dict
+    umbral_aplicado: Decimal
+    features_snapshot: dict[str, Any]
     explicabilidad_resumen: str | None
     fecha_hora_inferencia: datetime
-    resultado_simulado: bool
-    ya_existia: bool = False
-
-    @field_serializer("probabilidad_no_show", "umbral_aplicado")
-    def _tres_decimales(self, valor: float) -> float:
-        return round(float(valor), 3)
+    es_simulacion: bool = True
+    rotulo_etico: str = "Resultado simulado — Dataset sintético acreditado (RF-056)"
 
 
-class PaginaPrediccionesOut(BaseModel):
-    total: int
-    limite: int
-    desplazamiento: int
-    items: list[PrediccionOut]
+class ResultadoPrediccionLoteOut(BaseModel):
+    version_modelo: str
+    evaluadas: int
+    riesgo_alto: int
+    riesgo_medio: int
+    riesgo_bajo: int
+    predicciones: list[PrediccionIAOut]
 
 
-class ModeloActivoOut(BaseModel):
-    """GET /v1/modelo del servicio + disponibilidad. Si el servicio no responde, solo los 3 últimos."""
-    version_modelo: str | None = None
-    umbral: float | None = None
-    habilitado_piloto: bool | None = None
-    resultado_simulado: bool | None = None
-    version_dataset: str | None = None
-    fecha_aprobacion: str | None = None
-    variables: list[str] | None = None
-    disponible: bool
-    latencia_ms: int | None
-    corte_medio: float
+class MatrizConfusionOut(BaseModel):
+    tn: int
+    fp: int
+    fn: int
+    tp: int
 
 
-class LoteIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    desde: date
-    hasta: date
-    especialidad: Especialidad | None = None
-
-    @field_validator("hasta")
-    @classmethod
-    def _rango(cls, hasta: date, info: ValidationInfo) -> date:
-        desde = info.data.get("desde")
-        if desde is not None and hasta < desde:
-            raise ValueError("hasta debe ser igual o posterior a desde")
-        if desde is not None and hasta > desde + timedelta(days=MAX_DIAS_LOTE):
-            raise ValueError(f"hasta puede ser como máximo {MAX_DIAS_LOTE} días después de desde")
-        return hasta
+class BloqueMetricasOut(BaseModel):
+    umbral: float
+    f1_score: float
+    precision: float
+    recall: float
+    roc_auc: float
+    pr_auc: float
+    matriz_confusion: MatrizConfusionOut
 
 
-class FallaLote(BaseModel):
-    id_cita: int
-    codigo: str
+class MetricasModeloOut(BaseModel):
+    version_modelo: str
+    algoritmo: str
+    semilla: int
+    fecha_entrenamiento: str
+    es_simulacion: bool
+    rotulo_etico: str
+    umbral_alto: float
+    umbral_medio: float
+    cumple_meta_f1_82: bool
+    metricas_test: BloqueMetricasOut
+    metricas_val: BloqueMetricasOut
+    metricas_baseline_test: BloqueMetricasOut
+    auditoria_equidad: dict[str, Any]
+    importancia_global_variables: list[dict[str, Any]]
 
 
-class LoteOut(BaseModel):
-    evaluadas: int = 0
-    nuevas: int = 0
-    existentes: int = 0
-    no_elegibles: int = 0
-    fallidas: int = 0
-    detalle_fallas: list[FallaLote] = []
-    version_modelo: str | None = None
-    resultado_simulado: bool = True
+class DatasetResumenOut(BaseModel):
+    version_dataset: str
+    semilla: int
+    total_historicas: int
+    atendidas_historicas: int
+    no_show_historicas: int
+    proximas_operativas_bd: int
+    train_size: int
+    val_size: int
+    test_size: int
+    tasa_no_show_global: float
+    tasa_no_show_train: float
+    tasa_no_show_val: float
+    tasa_no_show_test: float
+    features_autorizadas: list[str]
+    control_leakage: dict[str, Any]
+    rotulo_etico: str
+
