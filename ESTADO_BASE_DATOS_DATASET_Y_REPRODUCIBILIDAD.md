@@ -200,3 +200,4 @@ Documentación interactiva disponible en: `http://127.0.0.1:8000/docs`.
 
 ---
 *Certificación emitida por la Dirección Técnica y DevOps de PrediCitas CRP.*
+

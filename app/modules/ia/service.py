@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 
-from app.core.errores import ConflictoDeNegocio, NoEncontrado
+from app.core.errores import Conflicto, NoEncontrado
 from app.modules.auditoria.service import registrar_evento
 from app.modules.auth.models import Usuario
 from app.modules.citas.models import Cita
@@ -45,7 +45,7 @@ def predecir_cita(
     if cita is None:
         raise NoEncontrado(f"No existe la cita {id_cita}")
     if cita.estado_actual not in ESTADOS_ELEGIBLES_PREDICCION:
-        raise ConflictoDeNegocio(
+        raise Conflicto(
             f"La cita {id_cita} se encuentra en estado final '{cita.estado_actual}' y no admite inferencia operativa"
         )
 

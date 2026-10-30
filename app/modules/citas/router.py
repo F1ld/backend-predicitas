@@ -136,3 +136,15 @@ def check_in(
     """M02-E06 (RF-104, D-012)."""
     observacion = datos.observacion if datos else None
     return service.registrar_check_in(db, id_cita, observacion, usuario, ip_cliente(request), ahora)
+
+
+@router.post("/{id_cita}/prediccion")
+def calcular_prediccion_cita(
+    id_cita: int,
+    request: Request,
+    usuario: Usuario = Depends(requiere_roles(*ESCRITORES)),
+    db: Session = Depends(get_db),
+):
+    """Calcula la predicción IA en demanda para la cita (RF-041 a RF-056)."""
+    from app.modules.ia.service import predecir_cita
+    return predecir_cita(db, id_cita, usuario=usuario, ip=ip_cliente(request))
