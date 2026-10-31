@@ -15,6 +15,7 @@ from app.modules.citas.router import router as citas_router
 from app.modules.ia.router import router as ia_router
 from app.modules.intervenciones.router import router as intervenciones_router
 from app.modules.lista_espera.router import router as lista_espera_router
+from app.modules.reportes.router import router as reportes_router
 from app.modules.usuarios.router import router as usuarios_router
 
 app = FastAPI(title="PrediCitas CRP API", version="0.5.0")
@@ -35,6 +36,7 @@ app.include_router(usuarios_router)
 app.include_router(ia_router)
 app.include_router(intervenciones_router)
 app.include_router(lista_espera_router)
+app.include_router(reportes_router)
 
 
 @app.get("/health", tags=["sistema"])

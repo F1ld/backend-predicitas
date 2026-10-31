@@ -7,10 +7,12 @@ from app.modules.citas.models import Cita
 from app.modules.citas.reglas import LIMA
 from app.modules.lista_espera import repository
 from app.modules.lista_espera.models import CupoLiberado, ListaEspera, Reasignacion
+from sqlalchemy import select
 from app.modules.lista_espera.schemas import (
     CandidatoCreateIn,
     CandidatoOut,
     CandidatoUpdateIn,
+    CupoDetalleOut,
     CupoLiberadoOut,
     PropuestaCandidatosOut,
     ReasignacionIn,
@@ -28,8 +30,47 @@ def _franja_de_cupo(db: Session, cupo: CupoLiberado) -> str:
 
 def _cupo_a_out(db: Session, cupo: CupoLiberado) -> CupoLiberadoOut:
     out = CupoLiberadoOut.model_validate(cupo)
-    out.franja_horaria = _franja_de_cupo(db, cupo)
+    cita_origen = db.get(Cita, cupo.id_cita_origen)
+    if cita_origen is not None:
+        out.id_cita_externa_origen = cita_origen.id_cita_externa
+        out.franja_horaria = cita_origen.franja_horaria
+    else:
+        out.id_cita_externa_origen = f"CIT-{cupo.id_cita_origen}"
+        hora_lima = cupo.fecha_hora_cupo.astimezone(LIMA).hour
+        out.franja_horaria = "MANANA" if hora_lima < 13 else "TARDE"
     return out
+
+
+def obtener_detalle_cupo(db: Session, id_cupo: int) -> CupoDetalleOut:
+    cupo = db.get(CupoLiberado, id_cupo)
+    if cupo is None:
+        raise NoEncontrado(f"No existe el cupo liberado {id_cupo}")
+
+    cupo_out = _cupo_a_out(db, cupo)
+    reasig = db.execute(
+        select(Reasignacion).where(Reasignacion.id_cupo_liberado == id_cupo)
+    ).scalar_one_or_none()
+
+    reasig_out = None
+    if reasig:
+        reasig_out = ReasignacionOut(
+            id_reasignacion=reasig.id_reasignacion,
+            id_cupo_liberado=reasig.id_cupo_liberado,
+            id_candidato=reasig.id_candidato,
+            id_operador_confirma=reasig.id_operador_confirma,
+            confirmacion_humana=reasig.confirmacion_humana,
+            medio_confirmacion=reasig.medio_confirmacion,
+            observaciones=reasig.observaciones,
+            fecha_hora_reasigna=reasig.fecha_hora_reasigna,
+            estado_cupo_final=cupo.estado_cupo,
+            estado_candidato_final="ASIGNADO",
+        )
+
+    return CupoDetalleOut(
+        **cupo_out.model_dump(),
+        reasignacion=reasig_out,
+        historial_ofertas=[],
+    )
 
 
 def crear_candidato(

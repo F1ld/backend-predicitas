@@ -12,9 +12,13 @@ from app.modules.intervenciones.models import Intervencion
 from app.modules.intervenciones.schemas import (
     BandejaIntervencionesOut,
     CitaSugeridaIntervencionOut,
+    ElegibleOut,
     IntervencionCreateIn,
     IntervencionOut,
     IntervencionRespuestaIn,
+    PaginaElegiblesOut,
+    PaginaIntervencionesOut,
+    RiesgoResumen,
 )
 from app.modules.lista_espera.models import CupoLiberado
 
@@ -32,7 +36,96 @@ def _enriquecer_out(
     base = IntervencionOut.model_validate(intervencion)
     base.estado_cita_actual = estado_cita_actual
     base.id_cupo_liberado_generado = id_cupo_liberado
+    if getattr(intervencion, "cita", None) is not None:
+        base.id_cita_externa = intervencion.cita.id_cita_externa
+
+    acciones = []
+    if intervencion.estado_intervencion == "PENDIENTE":
+        acciones.append("REGISTRAR_ENVIO")
+    elif intervencion.estado_intervencion == "ENVIADA":
+        acciones.extend(["REGISTRAR_ENTREGA", "REGISTRAR_FALLO", "REGISTRAR_RESPUESTA"])
+    elif intervencion.estado_intervencion == "ENTREGADA":
+        acciones.extend(["REGISTRAR_RESPUESTA", "REGISTRAR_FALLO"])
+    elif intervencion.estado_intervencion == "RESPONDIDA":
+        if intervencion.respuesta_paciente == "CONFIRMA":
+            acciones.append("CONFIRMAR_CITA")
+        elif intervencion.respuesta_paciente == "SOLICITA_LIBERACION":
+            acciones.append("LIBERAR_CUPO")
+    if not intervencion.consentimiento_optout:
+        acciones.append("REGISTRAR_OPTOUT")
+    base.acciones_disponibles = acciones
     return base
+
+
+def listar_citas_elegibles(
+    db: Session,
+    *,
+    desde: str | None = None,
+    hasta: str | None = None,
+    especialidad: str | None = None,
+    nivel_riesgo: str | None = None,
+    limite: int = 50,
+    desplazamiento: int = 0,
+) -> PaginaElegiblesOut:
+    pares = repository.listar_citas_riesgo_medio_alto(
+        db,
+        nivel_riesgo=nivel_riesgo,
+        especialidad=especialidad,
+    )
+    items: list[ElegibleOut] = []
+    vistos: set[int] = set()
+    for cita, pred in pares:
+        if cita.id_cita in vistos:
+            continue
+        vistos.add(cita.id_cita)
+
+        if desde:
+            try:
+                if cita.fecha_hora_cita < datetime.fromisoformat(desde):
+                    continue
+            except ValueError:
+                pass
+        if hasta:
+            try:
+                if cita.fecha_hora_cita > datetime.fromisoformat(f"{hasta}T23:59:59"):
+                    continue
+            except ValueError:
+                pass
+
+        enviadas = repository.contar_activas_por_cita(db, cita.id_cita)
+        optout = repository.tiene_optout_vigente(db, cita.id_cita, cita.paciente_anon_id)
+        if optout:
+            continue
+
+        items.append(
+            ElegibleOut(
+                id_cita=cita.id_cita,
+                id_cita_externa=cita.id_cita_externa,
+                paciente_anon_id=cita.paciente_anon_id,
+                especialidad=cita.especialidad,
+                medico=cita.medico,
+                fecha_hora_cita=cita.fecha_hora_cita,
+                estado_actual=cita.estado_actual,
+                riesgo=RiesgoResumen(
+                    id_prediccion=pred.id_prediccion,
+                    probabilidad_no_show=float(pred.probabilidad_no_show),
+                    nivel_riesgo=pred.nivel_riesgo,
+                    version_modelo=pred.version_modelo,
+                    fecha_hora_inferencia=pred.fecha_hora_inferencia,
+                    resultado_simulado=bool(getattr(pred, "resultado_simulado", False)),
+                ),
+                intervenciones_previas=enviadas,
+            )
+        )
+
+    total = len(items)
+    paginados = items[desplazamiento : desplazamiento + limite]
+    return PaginaElegiblesOut(
+        total=total,
+        limite=limite,
+        desplazamiento=desplazamiento,
+        items=paginados,
+    )
 
 
 def listar_bandeja_intervenciones(

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,11 +34,26 @@ class CandidatoOut(BaseModel):
     criterio_compatibilidad: str | None = None
 
 
+class PaginaCandidatoOut(BaseModel):
+    total: int
+    limite: int
+    desplazamiento: int
+    items: list[CandidatoOut]
+
+
+class OfertaOut(BaseModel):
+    id_candidato: int
+    paciente_anon_id: str
+    id_operador: int
+    fecha_hora_oferta: datetime
+
+
 class CupoLiberadoOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id_cupo_liberado: int
     id_cita_origen: int
+    id_cita_externa_origen: str = ""
     especialidad: str
     medico: str
     fecha_hora_cupo: datetime
@@ -46,6 +61,14 @@ class CupoLiberadoOut(BaseModel):
     estado_cupo: str
     origen_liberacion: str
     liberado_en: datetime
+    oferta_vigente: OfertaOut | None = None
+
+
+class PaginaCupoOut(BaseModel):
+    total: int
+    limite: int
+    desplazamiento: int
+    items: list[CupoLiberadoOut]
 
 
 class PropuestaCandidatosOut(BaseModel):
@@ -77,3 +100,21 @@ class ReasignacionOut(BaseModel):
     estado_cupo_final: str
     estado_candidato_final: str
 
+
+class HistorialOfertaOut(BaseModel):
+    id_candidato: int
+    fecha_hora_oferta: datetime
+    cierre: str | None = None
+
+
+class CupoDetalleOut(CupoLiberadoOut):
+    reasignacion: ReasignacionOut | None = None
+    historial_ofertas: list[HistorialOfertaOut] = Field(default_factory=list)
+
+
+class OfertaIn(BaseModel):
+    id_candidato: int
+
+
+class CierreOfertaIn(BaseModel):
+    respuesta: Literal["RECHAZA", "SIN_RESPUESTA"]

@@ -31,6 +31,7 @@ class IntervencionOut(BaseModel):
 
     id_intervencion: int
     id_cita: int
+    id_cita_externa: str = ""
     id_operador: int | None
     canal_contacto: str
     plantilla_mensaje: str
@@ -41,6 +42,7 @@ class IntervencionOut(BaseModel):
     fecha_hora_respuesta: datetime | None
     estado_cita_actual: str | None = None
     id_cupo_liberado_generado: int | None = None
+    acciones_disponibles: list[str] = Field(default_factory=list)
 
 
 class CitaSugeridaIntervencionOut(BaseModel):
@@ -61,9 +63,47 @@ class CitaSugeridaIntervencionOut(BaseModel):
     tiene_optout: bool
 
 
+class RiesgoResumen(BaseModel):
+    id_prediccion: int
+    probabilidad_no_show: float
+    nivel_riesgo: str
+    version_modelo: str
+    fecha_hora_inferencia: datetime
+    resultado_simulado: bool = False
+
+
+class ElegibleOut(BaseModel):
+    id_cita: int
+    id_cita_externa: str
+    paciente_anon_id: str
+    especialidad: str
+    medico: str
+    fecha_hora_cita: datetime
+    estado_actual: str
+    riesgo: RiesgoResumen
+    intervenciones_previas: int = 0
+
+
+class PaginaElegiblesOut(BaseModel):
+    total: int
+    limite: int
+    desplazamiento: int
+    items: list[ElegibleOut]
+
+
+class PaginaIntervencionesOut(BaseModel):
+    total: int
+    limite: int
+    desplazamiento: int
+    items: list[IntervencionOut]
+    total_sugeridas: int = 0
+    total_intervenciones: int = 0
+    citas_sugeridas: list[CitaSugeridaIntervencionOut] = Field(default_factory=list)
+    historial_intervenciones: list[IntervencionOut] = Field(default_factory=list)
+
+
 class BandejaIntervencionesOut(BaseModel):
     total_sugeridas: int
     total_intervenciones: int
     citas_sugeridas: list[CitaSugeridaIntervencionOut]
     historial_intervenciones: list[IntervencionOut]
-
