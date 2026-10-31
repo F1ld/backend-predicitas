@@ -1,18 +1,37 @@
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field
 
-from app.core.dominio import CANALES_CONTACTO, RESPUESTAS_PACIENTE
-from app.modules.citas.schemas import CupoOut, RiesgoResumen  # formas de modulo-02 y modulo-06
 
-__all__ = ["CupoOut", "RiesgoResumen"]
+class IntervencionCreateIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    canal_contacto: Literal["WHATSAPP", "SMS", "LLAMADA_TELEFONICA"]
+    plantilla_mensaje: str = Field(
+        default="PLANTILLA_CONFIRMACION_PREVENTIVA",
+        min_length=1,
+        max_length=100,
+    )
+    consentimiento_optout: bool = False
+    estado_intervencion: Literal["PENDIENTE", "ENVIADA", "ENTREGADA", "FALLIDA"] = "ENVIADA"
+
+
+class IntervencionRespuestaIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    respuesta_paciente: Literal["CONFIRMA", "SOLICITA_LIBERACION", "SOLICITA_REPROG", "SIN_RESPUESTA"]
+    consentimiento_optout: bool | None = None
+    observacion: str | None = Field(default=None, max_length=255)
 
 
 class IntervencionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id_intervencion: int
     id_cita: int
-    id_cita_externa: str
+    id_cita_externa: str = ""
     id_operador: int | None
     canal_contacto: str
     plantilla_mensaje: str
@@ -21,14 +40,36 @@ class IntervencionOut(BaseModel):
     respuesta_paciente: str | None
     fecha_hora_envio: datetime
     fecha_hora_respuesta: datetime | None
-    acciones_disponibles: list[str]
+    estado_cita_actual: str | None = None
+    id_cupo_liberado_generado: int | None = None
+    acciones_disponibles: list[str] = Field(default_factory=list)
 
 
-class PaginaIntervencionesOut(BaseModel):
-    total: int
-    limite: int
-    desplazamiento: int
-    items: list[IntervencionOut]
+class CitaSugeridaIntervencionOut(BaseModel):
+    id_cita: int
+    id_cita_externa: str
+    paciente_anon_id: str
+    especialidad: str
+    medico: str
+    fecha_hora_cita: datetime
+    franja_horaria: str
+    estado_actual: str
+    probabilidad_no_show: Decimal
+    nivel_riesgo: str
+    explicabilidad_resumen: str | None
+    accion_sugerida: str
+    canal_sugerido: str
+    intervenciones_enviadas: int
+    tiene_optout: bool
+
+
+class RiesgoResumen(BaseModel):
+    id_prediccion: int
+    probabilidad_no_show: float
+    nivel_riesgo: str
+    version_modelo: str
+    fecha_hora_inferencia: datetime
+    resultado_simulado: bool = False
 
 
 class ElegibleOut(BaseModel):
@@ -40,7 +81,7 @@ class ElegibleOut(BaseModel):
     fecha_hora_cita: datetime
     estado_actual: str
     riesgo: RiesgoResumen
-    intervenciones_previas: int
+    intervenciones_previas: int = 0
 
 
 class PaginaElegiblesOut(BaseModel):
@@ -50,66 +91,19 @@ class PaginaElegiblesOut(BaseModel):
     items: list[ElegibleOut]
 
 
-class IntervencionIn(BaseModel):
-    """M05-E02 (RF-063, RN13, D-024). consentimiento_confirmado solo admite el booleano JSON literal:
-    StrictBool rechaza 1, "true", "yes", 0 o "false" con 422 VALIDACION (sin coerción). La ausencia,
-    null y false llegan al servicio, que responde 422 CONSENTIMIENTO_REQUERIDO si no es true."""
-
-    id_cita: int
-    canal_contacto: Literal[CANALES_CONTACTO]  # type: ignore[valid-type]
-    plantilla_mensaje: str = Field(min_length=1, max_length=100)
-    consentimiento_confirmado: StrictBool | None = None
-
-
-class EstadoEnvioIn(BaseModel):
-    estado_intervencion: Literal["ENVIADA", "ENTREGADA", "FALLIDA"]
+class PaginaIntervencionesOut(BaseModel):
+    total: int
+    limite: int
+    desplazamiento: int
+    items: list[IntervencionOut]
+    total_sugeridas: int = 0
+    total_intervenciones: int = 0
+    citas_sugeridas: list[CitaSugeridaIntervencionOut] = Field(default_factory=list)
+    historial_intervenciones: list[IntervencionOut] = Field(default_factory=list)
 
 
-class RespuestaIn(BaseModel):
-    respuesta_paciente: Literal[RESPUESTAS_PACIENTE]  # type: ignore[valid-type]
-    optout: bool = False
-
-
-class LiberarIn(BaseModel):
-    motivo: str | None = Field(default=None, max_length=255)
-
-
-class PlantillaOut(BaseModel):
-    id: str
-    canal_contacto: str
-    descripcion: str
-    contenido: str
-
-
-class Rep02Fila(BaseModel):
-    id_intervencion: int
-    id_cita_externa: str
-    especialidad: str
-    nivel_riesgo: str | None
-    canal_contacto: str
-    estado_intervencion: str
-    respuesta_paciente: str | None
-    tiempo_respuesta_minutos: int | None
-    cupo_liberado: bool
-
-
-class Rep02Resumen(BaseModel):
-    enviadas: int
-    entregadas: int
-    respondidas: int
-    confirmaciones: int
-    liberaciones: int
-    tasa_respuesta: float
-
-
-class Rep02PorCanal(BaseModel):
-    canal_contacto: str
-    respuesta_paciente: str | None
-    cantidad: int
-
-
-class Rep02Out(BaseModel):
-    resumen: Rep02Resumen
-    por_canal: list[Rep02PorCanal]
-    filas: list[Rep02Fila]
-    resultado_simulado: bool
+class BandejaIntervencionesOut(BaseModel):
+    total_sugeridas: int
+    total_intervenciones: int
+    citas_sugeridas: list[CitaSugeridaIntervencionOut]
+    historial_intervenciones: list[IntervencionOut]

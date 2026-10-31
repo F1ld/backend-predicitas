@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.core.dominio import DIAS_SEMANA
@@ -25,6 +25,20 @@ TRANSICIONES = {
 }
 
 # Evento de auditoría que representa la llegada del paciente (D-012, RF-104).
+
+# Estados desde los que se habilita la transicin hacia 'LIBERADA' ante respuesta
+# voluntaria del paciente ('SOLICITA_LIBERACION') en el flujo de Intervencin (RN04 / RF-068).
+ESTADOS_LIBERABLES_POR_INTERVENCION = {"RECIBIDA", "CONFIRMADA", "REPROGRAMADA"}
+TRANSICIONES_INTERVENCION = {
+    estado: (destinos | {"LIBERADA"}) for estado, destinos in TRANSICIONES.items()
+}
+
+
+def puede_transicionar_a_liberada(estado_actual: str) -> bool:
+    """Verifica si la cita puede pasar a LIBERADA por solicitud voluntaria del paciente."""
+    return estado_actual in ESTADOS_LIBERABLES_POR_INTERVENCION
+
+
 ACCION_CHECK_IN = "CHECK_IN"
 
 
@@ -70,3 +84,5 @@ def contar_previos(desenlaces: list[tuple[datetime, str]], fecha_registro_cita: 
     solo citas con desenlace cuya fecha_hora_cita es anterior al registro de la nueva cita."""
     previas = [estado for fecha, estado in desenlaces if fecha < fecha_registro_cita]
     return previas.count("NO_SHOW"), previas.count("ATENDIDA")
+
+

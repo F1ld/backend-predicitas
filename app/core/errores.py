@@ -82,3 +82,6 @@ class DemasiadosIntentos(ErrorDeNegocio):
 class MotorIANoDisponible(ErrorDeNegocio):
     codigo_http = 503
     codigo = "MOTOR_IA_NO_DISPONIBLE"
+
+ConflictoDeNegocio = Conflicto
+ReglaDeNegocioInvalida = SolicitudInvalida

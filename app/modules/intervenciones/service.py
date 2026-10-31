@@ -1,305 +1,387 @@
-"""Servicio de M05 · Intervención inteligente (F-09, D-013, RF-057 a RF-068, REP-02).
+from datetime import datetime, timezone
 
-Toda operación confirma en una sola transacción la intervención (o la cita y el cupo)
-junto con su auditoría (RNF-014). La auditoría solo guarda IDs y paciente_anon_id.
-"""
-from collections import Counter
-from datetime import date, datetime, timedelta
-
-from fastapi import Response
 from sqlalchemy.orm import Session
 
-from app.core.dominio import CANALES_CONTACTO
-from app.core.errores import Conflicto, NoEncontrado, TransicionInvalida, Validacion
-from app.core.exportacion import FORMATOS, responder
+from app.core.errores import ConflictoDeNegocio, NoEncontrado, TransicionInvalida
 from app.modules.auditoria.service import registrar_evento
 from app.modules.auth.models import Usuario
-from app.modules.citas.models import Cita
-from app.modules.citas.reglas import ESTADOS_ACTIVOS, fecha_lima, franja_de
-from app.modules.citas.service import transicionar
+from app.modules.citas.models import Cita, HistorialEstadoCita
+from app.modules.citas.reglas import TRANSICIONES, puede_transicionar_a_liberada
 from app.modules.intervenciones import repository
 from app.modules.intervenciones.models import Intervencion
-from app.modules.intervenciones.reglas import (CONTENIDO_PENDIENTE, NIVELES_ELEGIBLES, PLANTILLAS,
-                                               TRANSICIONES_ENVIO, acciones_disponibles,
-                                               admite_respuesta, canales_de, puede_crear_otra)
-from app.modules.intervenciones.schemas import (CupoOut, ElegibleOut, IntervencionIn, IntervencionOut,
-                                                PaginaElegiblesOut, PaginaIntervencionesOut, PlantillaOut,
-                                                Rep02Fila, Rep02Out, Rep02PorCanal, Rep02Resumen,
-                                                RiesgoResumen)
+from app.modules.intervenciones.schemas import (
+    BandejaIntervencionesOut,
+    CitaSugeridaIntervencionOut,
+    ElegibleOut,
+    IntervencionCreateIn,
+    IntervencionOut,
+    IntervencionRespuestaIn,
+    PaginaElegiblesOut,
+    PaginaIntervencionesOut,
+    RiesgoResumen,
+)
 from app.modules.lista_espera.models import CupoLiberado
 
-MODULO = "INTERVENCION"
-# Los envíos son simulados y el riesgo sale de un modelo con datos sintéticos (RF-056, RN16).
-RESULTADO_SIMULADO = True
-COLUMNAS_REP02 = list(Rep02Fila.model_fields)
+# Regla normativa RN07 / RF-066 / RNF-032: máximo 1 recordatorio adicional preventivo por cita.
+MAX_RECORDATORIOS_ADICIONALES_POR_CITA = 1
+ESTADOS_CITA_INTERVENIBLES = {"RECIBIDA", "CONFIRMADA", "REPROGRAMADA"}
 
 
-def _out(inter: Intervencion, cita: Cita) -> IntervencionOut:
-    return IntervencionOut(
-        id_intervencion=inter.id_intervencion, id_cita=inter.id_cita, id_cita_externa=cita.id_cita_externa,
-        id_operador=inter.id_operador, canal_contacto=inter.canal_contacto,
-        plantilla_mensaje=inter.plantilla_mensaje, consentimiento_optout=inter.consentimiento_optout,
-        estado_intervencion=inter.estado_intervencion, respuesta_paciente=inter.respuesta_paciente,
-        fecha_hora_envio=inter.fecha_hora_envio, fecha_hora_respuesta=inter.fecha_hora_respuesta,
-        acciones_disponibles=acciones_disponibles(
-            inter.estado_intervencion, inter.canal_contacto, inter.respuesta_paciente,
-            inter.consentimiento_optout, cita.estado_actual),
-    )
+def _enriquecer_out(
+    intervencion: Intervencion,
+    *,
+    estado_cita_actual: str | None = None,
+    id_cupo_liberado: int | None = None,
+) -> IntervencionOut:
+    base = IntervencionOut.model_validate(intervencion)
+    base.estado_cita_actual = estado_cita_actual
+    base.id_cupo_liberado_generado = id_cupo_liberado
+    if getattr(intervencion, "cita", None) is not None:
+        base.id_cita_externa = intervencion.cita.id_cita_externa
+
+    acciones = []
+    if intervencion.estado_intervencion == "PENDIENTE":
+        acciones.append("REGISTRAR_ENVIO")
+    elif intervencion.estado_intervencion == "ENVIADA":
+        acciones.extend(["REGISTRAR_ENTREGA", "REGISTRAR_FALLO", "REGISTRAR_RESPUESTA"])
+    elif intervencion.estado_intervencion == "ENTREGADA":
+        acciones.extend(["REGISTRAR_RESPUESTA", "REGISTRAR_FALLO"])
+    elif intervencion.estado_intervencion == "RESPONDIDA":
+        if intervencion.respuesta_paciente == "CONFIRMA":
+            acciones.append("CONFIRMAR_CITA")
+        elif intervencion.respuesta_paciente == "SOLICITA_LIBERACION":
+            acciones.append("LIBERAR_CUPO")
+    if not intervencion.consentimiento_optout:
+        acciones.append("REGISTRAR_OPTOUT")
+    base.acciones_disponibles = acciones
+    return base
 
 
-def _foto(inter: Intervencion) -> dict:
-    return {"estado_intervencion": inter.estado_intervencion, "respuesta_paciente": inter.respuesta_paciente,
-            "consentimiento_optout": inter.consentimiento_optout}
-
-
-def _buscar(db: Session, id_intervencion: int, *, bloquear: bool = False) -> tuple[Intervencion, Cita]:
-    fila = repository.con_cita(db, id_intervencion, bloquear=bloquear)
-    if fila is None:
-        raise NoEncontrado(f"No existe la intervención {id_intervencion}")
-    return fila
-
-
-def _auditar(db, accion, inter, usuario, ip, antes=None, despues=None, **extra):
-    registrar_evento(
-        db, modulo=MODULO, accion=accion, entidad_afectada="intervenciones", direccion_ip=ip,
-        id_usuario=usuario.id_usuario, id_entidad=inter.id_intervencion,
-        datos_before=antes, datos_after={**(despues or _foto(inter)), **extra},
-    )
-
-
-# ---------------------------------------------------------------- lectura
-
-def elegibles(
-    db: Session, *, ahora: datetime, desde: date | None, hasta: date | None, especialidad: str | None,
-    nivel_riesgo: str | None, limite: int, desplazamiento: int,
+def listar_citas_elegibles(
+    db: Session,
+    *,
+    desde: str | None = None,
+    hasta: str | None = None,
+    especialidad: str | None = None,
+    nivel_riesgo: str | None = None,
+    limite: int = 50,
+    desplazamiento: int = 0,
 ) -> PaginaElegiblesOut:
-    """M05-E01 (RF-057). Por defecto, de hoy a hoy + 7 (en Lima)."""
-    desde = desde or fecha_lima(ahora)
-    hasta = hasta or desde + timedelta(days=7)
-    total, filas = repository.elegibles(
-        db, ahora=ahora, desde=desde, hasta=hasta, especialidad=especialidad, nivel_riesgo=nivel_riesgo,
-        limite=limite, desplazamiento=desplazamiento,
+    pares = repository.listar_citas_riesgo_medio_alto(
+        db,
+        nivel_riesgo=nivel_riesgo,
+        especialidad=especialidad,
     )
-    items = [
-        ElegibleOut(
-            id_cita=cita.id_cita, id_cita_externa=cita.id_cita_externa, paciente_anon_id=cita.paciente_anon_id,
-            especialidad=cita.especialidad, medico=cita.medico, fecha_hora_cita=cita.fecha_hora_cita,
-            estado_actual=cita.estado_actual, intervenciones_previas=previas,
-            riesgo=RiesgoResumen(id_prediccion=id_pred, probabilidad_no_show=float(prob), nivel_riesgo=nivel,
-                                 version_modelo=version, fecha_hora_inferencia=fecha,
-                                 resultado_simulado=RESULTADO_SIMULADO),
+    items: list[ElegibleOut] = []
+    vistos: set[int] = set()
+    for cita, pred in pares:
+        if cita.id_cita in vistos:
+            continue
+        vistos.add(cita.id_cita)
+
+        if desde:
+            try:
+                if cita.fecha_hora_cita < datetime.fromisoformat(desde):
+                    continue
+            except ValueError:
+                pass
+        if hasta:
+            try:
+                if cita.fecha_hora_cita > datetime.fromisoformat(f"{hasta}T23:59:59"):
+                    continue
+            except ValueError:
+                pass
+
+        enviadas = repository.contar_activas_por_cita(db, cita.id_cita)
+        optout = repository.tiene_optout_vigente(db, cita.id_cita, cita.paciente_anon_id)
+        if optout:
+            continue
+
+        items.append(
+            ElegibleOut(
+                id_cita=cita.id_cita,
+                id_cita_externa=cita.id_cita_externa,
+                paciente_anon_id=cita.paciente_anon_id,
+                especialidad=cita.especialidad,
+                medico=cita.medico,
+                fecha_hora_cita=cita.fecha_hora_cita,
+                estado_actual=cita.estado_actual,
+                riesgo=RiesgoResumen(
+                    id_prediccion=pred.id_prediccion,
+                    probabilidad_no_show=float(pred.probabilidad_no_show),
+                    nivel_riesgo=pred.nivel_riesgo,
+                    version_modelo=pred.version_modelo,
+                    fecha_hora_inferencia=pred.fecha_hora_inferencia,
+                    resultado_simulado=bool(getattr(pred, "resultado_simulado", False)),
+                ),
+                intervenciones_previas=enviadas,
+            )
         )
-        for cita, id_pred, prob, nivel, version, fecha, previas in filas
-    ]
-    return PaginaElegiblesOut(total=total, limite=limite, desplazamiento=desplazamiento, items=items)
+
+    total = len(items)
+    paginados = items[desplazamiento : desplazamiento + limite]
+    return PaginaElegiblesOut(
+        total=total,
+        limite=limite,
+        desplazamiento=desplazamiento,
+        items=paginados,
+    )
 
 
-def listar(db: Session, **filtros) -> PaginaIntervencionesOut:
-    """M05-E03."""
-    total, filas = repository.listar(db, **filtros)
-    return PaginaIntervencionesOut(total=total, limite=filtros["limite"], desplazamiento=filtros["desplazamiento"],
-                                   items=[_out(i, c) for i, c in filas])
+def listar_bandeja_intervenciones(
+    db: Session,
+    *,
+    nivel_riesgo: str | None = None,
+    especialidad: str | None = None,
+    estado_intervencion: str | None = None,
+    canal_contacto: str | None = None,
+) -> BandejaIntervencionesOut:
+    pares = repository.listar_citas_riesgo_medio_alto(
+        db,
+        nivel_riesgo=nivel_riesgo,
+        especialidad=especialidad,
+    )
+
+    sugeridas: list[CitaSugeridaIntervencionOut] = []
+    vistos: set[int] = set()
+    for cita, pred in pares:
+        if cita.id_cita in vistos:
+            continue
+        vistos.add(cita.id_cita)
+        enviadas = repository.contar_activas_por_cita(db, cita.id_cita)
+        optout = repository.tiene_optout_vigente(db, cita.id_cita, cita.paciente_anon_id)
+        if pred.nivel_riesgo == "ALTO":
+            accion_sug = "CONFIRMACION_PREVIA_O_LIBERACION_VOLUNTARIA"
+            canal_sug = "LLAMADA_TELEFONICA"
+        else:
+            accion_sug = "RECORDATORIO_PREVENTIVO_ADICIONAL"
+            canal_sug = "WHATSAPP"
+
+        sugeridas.append(
+            CitaSugeridaIntervencionOut(
+                id_cita=cita.id_cita,
+                id_cita_externa=cita.id_cita_externa,
+                paciente_anon_id=cita.paciente_anon_id,
+                especialidad=cita.especialidad,
+                medico=cita.medico,
+                fecha_hora_cita=cita.fecha_hora_cita,
+                franja_horaria=cita.franja_horaria,
+                estado_actual=cita.estado_actual,
+                probabilidad_no_show=pred.probabilidad_no_show,
+                nivel_riesgo=pred.nivel_riesgo,
+                explicabilidad_resumen=pred.explicabilidad_resumen,
+                accion_sugerida=accion_sug,
+                canal_sugerido=canal_sug,
+                intervenciones_enviadas=enviadas,
+                tiene_optout=optout,
+            )
+        )
+
+    historial = repository.listar_historial(
+        db,
+        estado_intervencion=estado_intervencion,
+        canal_contacto=canal_contacto,
+    )
+    return BandejaIntervencionesOut(
+        total_sugeridas=len(sugeridas),
+        total_intervenciones=len(historial),
+        citas_sugeridas=sugeridas,
+        historial_intervenciones=[IntervencionOut.model_validate(i) for i in historial],
+    )
 
 
-def detalle(db: Session, id_intervencion: int) -> IntervencionOut:
-    """M05-E04."""
-    return _out(*_buscar(db, id_intervencion))
-
-
-def plantillas() -> list[PlantillaOut]:
-    """M05-E09: catálogo fijo; el texto aún no está aprobado."""
-    return [PlantillaOut(id=nombre, canal_contacto=canal, descripcion=descripcion, contenido=CONTENIDO_PENDIENTE)
-            for nombre, canales, descripcion in PLANTILLAS for canal in canales]
-
-
-# ---------------------------------------------------------------- creación
-
-def crear(db: Session, datos: IntervencionIn, usuario: Usuario, ip: str, ahora: datetime,
-          modo_sombra: bool) -> IntervencionOut:
-    """M05-E02 (RF-058, RF-063, RF-066, RN07, RN13)."""
-    if datos.consentimiento_confirmado is not True:  # false, null o ausente (D-024)
-        raise Validacion("Debe confirmar que el paciente tiene consentimiento para comunicaciones",
-                         codigo="CONSENTIMIENTO_REQUERIDO",
-                         campos={"consentimiento_confirmado": "Debe ser true"})
-    if datos.canal_contacto not in canales_de(datos.plantilla_mensaje):
-        raise Validacion("La plantilla no existe o no corresponde al canal",
-                         campos={"plantilla_mensaje": "Plantilla no válida para el canal"})
-
-    cita = db.get(Cita, datos.id_cita, with_for_update=True)  # serializa creaciones sobre la misma cita
+def crear_intervencion(
+    db: Session,
+    id_cita: int,
+    datos: IntervencionCreateIn,
+    *,
+    usuario: Usuario,
+    ip: str,
+) -> IntervencionOut:
+    cita = db.get(Cita, id_cita, with_for_update=True)
     if cita is None:
-        raise NoEncontrado(f"No existe la cita {datos.id_cita}")
-    if modo_sombra:
-        raise Conflicto("Modo sombra activo: las intervenciones no se envían", codigo="MODO_SOMBRA")
+        raise NoEncontrado(f"No existe la cita {id_cita}")
+    if cita.estado_actual not in ESTADOS_CITA_INTERVENIBLES:
+        raise ConflictoDeNegocio(
+            f"La cita {id_cita} está en estado '{cita.estado_actual}' y no admite nuevas intervenciones"
+        )
 
-    prediccion = repository.ultima_prediccion_de(db, cita.id_cita)
-    if (cita.estado_actual not in ESTADOS_ACTIVOS or cita.fecha_hora_cita <= ahora
-            or prediccion is None or prediccion.nivel_riesgo not in NIVELES_ELEGIBLES):
-        raise Conflicto("La cita no es elegible: debe ser futura, no final y con riesgo ALTO o MEDIO",
-                        codigo="NO_ELEGIBLE")
-    if repository.optout_vigente(db, cita.paciente_anon_id):
-        raise Conflicto("El paciente pidió no recibir comunicaciones", codigo="OPTOUT_VIGENTE")
-    if not puede_crear_otra(repository.estados_previos(db, cita.id_cita)):
-        raise Conflicto("La cita ya tiene su intervención (o su único reintento tras un fallo)",
-                        codigo="LIMITE_INTERVENCION")
+    # Regla dura 1: Derecho de oposición / Opt-Out (RF-064, RF-065, RN07)
+    if datos.consentimiento_optout or repository.tiene_optout_vigente(db, id_cita, cita.paciente_anon_id):
+        raise ConflictoDeNegocio(
+            "Envío rechazado: el paciente ejerció su derecho de oposición (consentimiento_optout=True) "
+            "y no puede recibir intervenciones preventivas (RF-065 / RN07)"
+        )
 
-    inter = Intervencion(
-        id_cita=cita.id_cita, id_operador=usuario.id_usuario, canal_contacto=datos.canal_contacto,
-        plantilla_mensaje=datos.plantilla_mensaje, consentimiento_optout=False, estado_intervencion="PENDIENTE",
+    # Regla dura 2: Máximo 1 recordatorio adicional por cita (RF-066, RNF-032, RN07)
+    enviadas_activas = repository.contar_activas_por_cita(db, id_cita)
+    if enviadas_activas >= MAX_RECORDATORIOS_ADICIONALES_POR_CITA:
+        raise ConflictoDeNegocio(
+            f"Envío rechazado: la cita {id_cita} ya alcanzó el límite normativo de máximo "
+            f"{MAX_RECORDATORIOS_ADICIONALES_POR_CITA} recordatorio adicional por cita (RF-066 / RN07)"
+        )
+
+    intervencion = Intervencion(
+        id_cita=cita.id_cita,
+        id_operador=usuario.id_usuario,
+        canal_contacto=datos.canal_contacto,
+        plantilla_mensaje=datos.plantilla_mensaje,
+        consentimiento_optout=False,
+        estado_intervencion=datos.estado_intervencion,
     )
-    db.add(inter)
+    db.add(intervencion)
     db.flush()
-    _auditar(db, "CREATE", inter, usuario, ip, despues={
-        **_foto(inter), "id_cita": cita.id_cita, "canal_contacto": inter.canal_contacto,
-        "plantilla_mensaje": inter.plantilla_mensaje, "id_prediccion": prediccion.id_prediccion,
-        "consentimiento_confirmado": True,
-    })
-    db.commit()
-    db.refresh(inter)  # fecha_hora_envio la pone la base
-    return _out(inter, cita)
 
-
-# ---------------------------------------------------------------- envío, respuesta y opt-out
-
-def cambiar_estado(db: Session, id_intervencion: int, estado_nuevo: str, usuario: Usuario, ip: str,
-                   ahora: datetime) -> IntervencionOut:
-    """M05-E05 (RF-059, RF-061): envío simulado."""
-    inter, cita = _buscar(db, id_intervencion, bloquear=True)
-    permitidos = TRANSICIONES_ENVIO.get(inter.estado_intervencion, set())
-    if estado_nuevo not in permitidos:
-        opciones = ", ".join(sorted(permitidos)) or "ninguno"
-        raise TransicionInvalida(
-            f"No se permite pasar de {inter.estado_intervencion} a {estado_nuevo}. Permitidos: {opciones}")
-    antes = _foto(inter)
-    inter.estado_intervencion = estado_nuevo
-    if estado_nuevo == "ENVIADA":
-        inter.fecha_hora_envio = ahora  # momento real del envío
-    _auditar(db, "UPDATE", inter, usuario, ip, antes=antes)
-    db.commit()
-    return _out(inter, cita)
-
-
-def _marcar_optout(db, inter, usuario, ip) -> None:
-    antes = _foto(inter)
-    inter.consentimiento_optout = True
-    _auditar(db, "OPTOUT", inter, usuario, ip, antes=antes)
-
-
-def responder_intervencion(db: Session, id_intervencion: int, respuesta: str, optout: bool, usuario: Usuario,
-                           ip: str, ahora: datetime) -> IntervencionOut:
-    """M05-E06 (RF-062, RF-064). Nunca cambia la cita (RF-067, RN02)."""
-    inter, cita = _buscar(db, id_intervencion, bloquear=True)
-    if not admite_respuesta(inter.estado_intervencion, inter.canal_contacto):
-        raise TransicionInvalida(
-            f"No se registra una respuesta en estado {inter.estado_intervencion} por {inter.canal_contacto}")
-    antes = _foto(inter)
-    inter.estado_intervencion = "RESPONDIDA"
-    inter.respuesta_paciente = respuesta
-    inter.fecha_hora_respuesta = ahora
-    _auditar(db, "RESPUESTA", inter, usuario, ip, antes=antes)
-    if optout and not inter.consentimiento_optout:
-        _marcar_optout(db, inter, usuario, ip)
-    db.commit()
-    return _out(inter, cita)
-
-
-def registrar_optout(db: Session, id_intervencion: int, usuario: Usuario, ip: str) -> IntervencionOut:
-    """M05-E07 (RF-064). Idempotente: un segundo opt-out no duplica el evento."""
-    inter, cita = _buscar(db, id_intervencion, bloquear=True)
-    if not inter.consentimiento_optout:
-        _marcar_optout(db, inter, usuario, ip)
-        db.commit()
-    return _out(inter, cita)
-
-
-# ---------------------------------------------------------------- liberación voluntaria
-
-def liberar_cupo(db: Session, id_intervencion: int, motivo: str | None, usuario: Usuario, ip: str,
-                 ahora: datetime) -> CupoOut:
-    """M05-E08 (RF-068, RN04): cita LIBERADA + historial + cupo DISPONIBLE + auditoría, todo o nada."""
-    inter, cita = _buscar(db, id_intervencion, bloquear=True)
-    if inter.respuesta_paciente != "SOLICITA_LIBERACION":
-        raise Conflicto("El paciente no solicitó liberar el cupo", codigo="SIN_SOLICITUD_LIBERACION")
-    if repository.cupo_de(db, cita.id_cita) is not None:
-        raise Conflicto("El cupo de esta cita ya fue liberado", codigo="CUPO_YA_LIBERADO")
-    if cita.estado_actual in ESTADOS_ACTIVOS and cita.fecha_hora_cita <= ahora:
-        raise Conflicto("Solo se libera el cupo de una cita futura", codigo="CITA_PASADA")
-
-    try:
-        transicionar(db, cita, "LIBERADA", usuario=usuario, ip=ip,
-                     motivo=motivo or "Liberación voluntaria solicitada por el paciente")  # 409 si es final
-        cupo = CupoLiberado(
-            id_cita_origen=cita.id_cita, especialidad=cita.especialidad, medico=cita.medico,
-            fecha_hora_cupo=cita.fecha_hora_cita, estado_cupo="DISPONIBLE", origen_liberacion="INTERVENCION_VOLUNTARIA",
-        )
-        db.add(cupo)
-        db.flush()
-        registrar_evento(
-            db, modulo=MODULO, accion="LIBERAR", entidad_afectada="cupos_liberados", direccion_ip=ip,
-            id_usuario=usuario.id_usuario, id_entidad=cupo.id_cupo_liberado,
-            datos_after={"id_cupo_liberado": cupo.id_cupo_liberado, "id_cita_origen": cita.id_cita,
-                         "id_intervencion": inter.id_intervencion, "estado_cupo": cupo.estado_cupo,
-                         "origen_liberacion": cupo.origen_liberacion},
-        )
-        db.commit()  # RNF-014
-    except Exception:
-        db.rollback()  # nada queda a medias: ni cita LIBERADA sin cupo ni cupo sin cita
-        raise
-    db.refresh(cupo)
-    return CupoOut(
-        id_cupo_liberado=cupo.id_cupo_liberado, id_cita_origen=cita.id_cita, id_cita_externa_origen=cita.id_cita_externa,
-        especialidad=cupo.especialidad, medico=cupo.medico, fecha_hora_cupo=cupo.fecha_hora_cupo,
-        franja_horaria=franja_de(cupo.fecha_hora_cupo), estado_cupo=cupo.estado_cupo,
-        origen_liberacion=cupo.origen_liberacion, liberado_en=cupo.liberado_en, oferta_vigente=None,
-    )
-
-
-# ---------------------------------------------------------------- REP-02
-
-def _minutos(inter: Intervencion) -> int | None:
-    if inter.fecha_hora_respuesta is None:
-        return None
-    return max(0, int((inter.fecha_hora_respuesta - inter.fecha_hora_envio).total_seconds() // 60))
-
-
-def rep02(db: Session, *, desde, hasta, canal, nivel_riesgo, especialidad) -> Rep02Out:
-    filas = [
-        Rep02Fila(
-            id_intervencion=i.id_intervencion, id_cita_externa=id_ext, especialidad=esp, nivel_riesgo=nivel,
-            canal_contacto=i.canal_contacto, estado_intervencion=i.estado_intervencion,
-            respuesta_paciente=i.respuesta_paciente, tiempo_respuesta_minutos=_minutos(i), cupo_liberado=bool(cupo),
-        )
-        for i, id_ext, esp, nivel, cupo in repository.filas_rep02(
-            db, desde=desde, hasta=hasta, canal=canal, nivel_riesgo=nivel_riesgo, especialidad=especialidad)
-    ]
-    estados = Counter(f.estado_intervencion for f in filas)
-    entregadas = estados["ENTREGADA"] + estados["RESPONDIDA"]
-    resumen = Rep02Resumen(
-        enviadas=len(filas) - estados["PENDIENTE"], entregadas=entregadas, respondidas=estados["RESPONDIDA"],
-        confirmaciones=sum(f.respuesta_paciente == "CONFIRMA" for f in filas),
-        liberaciones=sum(f.cupo_liberado for f in filas),
-        tasa_respuesta=round(estados["RESPONDIDA"] / entregadas, 3) if entregadas else 0.0,
-    )
-    grupos = Counter((f.canal_contacto, f.respuesta_paciente) for f in filas)
-    por_canal = [Rep02PorCanal(canal_contacto=c, respuesta_paciente=r, cantidad=n)
-                 for (c, r), n in sorted(grupos.items(), key=lambda g: (CANALES_CONTACTO.index(g[0][0]), g[0][1] or "~"))]
-    return Rep02Out(resumen=resumen, por_canal=por_canal, filas=filas, resultado_simulado=RESULTADO_SIMULADO)
-
-
-def exportar_rep02(db: Session, formato: str, usuario: Usuario, ip: str, **filtros) -> Rep02Out | Response:
-    """M05-E10: json → Rep02Out; csv/xlsx → archivo con las filas y evento EXPORT (comun.json)."""
-    formato = (formato or "json").lower()
-    if formato not in FORMATOS:
-        raise Validacion("Formato no disponible: use json, csv o xlsx", codigo="FORMATO_NO_DISPONIBLE",
-                         campos={"formato": "Debe ser json, csv o xlsx"})
-    reporte = rep02(db, **filtros)
-    if formato == "json":
-        return reporte
-    respuesta = responder([f.model_dump() for f in reporte.filas], COLUMNAS_REP02, formato, "rep02_intervenciones")
     registrar_evento(
-        db, modulo="REPORTES", accion="EXPORT", entidad_afectada="intervenciones", direccion_ip=ip,
+        db,
+        modulo="INTERVENCION",
+        accion="CREATE",
+        entidad_afectada="intervenciones",
+        direccion_ip=ip,
         id_usuario=usuario.id_usuario,
-        datos_after={"reporte": "REP-02", "formato": formato, "filas": len(reporte.filas),
-                     "filtros": {k: (v.isoformat() if isinstance(v, date) else v) for k, v in filtros.items()}},
+        id_entidad=intervencion.id_intervencion,
+        datos_after={
+            "id_cita": cita.id_cita,
+            "canal_contacto": intervencion.canal_contacto,
+            "plantilla_mensaje": intervencion.plantilla_mensaje,
+            "estado_intervencion": intervencion.estado_intervencion,
+            "consentimiento_optout": intervencion.consentimiento_optout,
+        },
     )
     db.commit()
-    return respuesta
+    db.refresh(intervencion)
+    return _enriquecer_out(intervencion, estado_cita_actual=cita.estado_actual)
+
+
+def registrar_respuesta_intervencion(
+    db: Session,
+    id_intervencion: int,
+    datos: IntervencionRespuestaIn,
+    *,
+    usuario: Usuario,
+    ip: str,
+) -> IntervencionOut:
+    intervencion = db.get(Intervencion, id_intervencion, with_for_update=True)
+    if intervencion is None:
+        raise NoEncontrado(f"No existe la intervención {id_intervencion}")
+
+    cita = db.get(Cita, intervencion.id_cita, with_for_update=True)
+    if cita is None:
+        raise NoEncontrado(f"No existe la cita asociada {intervencion.id_cita}")
+
+    antes_intervencion = {
+        "estado_intervencion": intervencion.estado_intervencion,
+        "respuesta_paciente": intervencion.respuesta_paciente,
+        "consentimiento_optout": intervencion.consentimiento_optout,
+        "estado_cita": cita.estado_actual,
+    }
+
+    intervencion.respuesta_paciente = datos.respuesta_paciente
+    intervencion.estado_intervencion = "RESPONDIDA"
+    intervencion.fecha_hora_respuesta = datetime.now(timezone.utc)
+    if datos.consentimiento_optout is not None:
+        intervencion.consentimiento_optout = datos.consentimiento_optout
+
+    id_cupo_generado: int | None = None
+    estado_cita_anterior = cita.estado_actual
+
+    # Caso 1: El paciente CONFIRMA su asistencia -> Cita pasa a CONFIRMADA
+    if datos.respuesta_paciente == "CONFIRMA":
+        if cita.estado_actual != "CONFIRMADA":
+            permitidos = TRANSICIONES.get(cita.estado_actual, set())
+            if "CONFIRMADA" not in permitidos:
+                raise TransicionInvalida(
+                    f"La cita {cita.id_cita} en estado '{cita.estado_actual}' no puede pasar a CONFIRMADA"
+                )
+            cita.estado_actual = "CONFIRMADA"
+            db.add(
+                HistorialEstadoCita(
+                    id_cita=cita.id_cita,
+                    id_usuario_actor=usuario.id_usuario,
+                    estado_anterior=estado_cita_anterior,
+                    estado_nuevo="CONFIRMADA",
+                    motivo_cambio=datos.observacion or "Confirmación del paciente mediante intervención preventiva",
+                )
+            )
+
+    # Caso 2: El paciente SOLICITA_LIBERACION -> Cita pasa a LIBERADA + Crea CupoLiberado (DISPONIBLE) + Audita LIBERAR
+    elif datos.respuesta_paciente == "SOLICITA_LIBERACION":
+        if not puede_transicionar_a_liberada(cita.estado_actual):
+            raise TransicionInvalida(
+                f"La cita {cita.id_cita} en estado '{cita.estado_actual}' no puede liberarse"
+            )
+        cita.estado_actual = "LIBERADA"
+        db.add(
+            HistorialEstadoCita(
+                id_cita=cita.id_cita,
+                id_usuario_actor=usuario.id_usuario,
+                estado_anterior=estado_cita_anterior,
+                estado_nuevo="LIBERADA",
+                motivo_cambio=datos.observacion or "Liberación voluntaria del paciente en intervención (RN04)",
+            )
+        )
+
+        cupo_existente = repository.obtener_cupo_por_cita_origen(db, cita.id_cita)
+        if cupo_existente is None:
+            nuevo_cupo = CupoLiberado(
+                id_cita_origen=cita.id_cita,
+                especialidad=cita.especialidad,
+                medico=cita.medico,
+                fecha_hora_cupo=cita.fecha_hora_cita,
+                estado_cupo="DISPONIBLE",
+                origen_liberacion="INTERVENCION_VOLUNTARIA",
+            )
+            db.add(nuevo_cupo)
+            db.flush()
+            id_cupo_generado = nuevo_cupo.id_cupo_liberado
+        else:
+            id_cupo_generado = cupo_existente.id_cupo_liberado
+
+        registrar_evento(
+            db,
+            modulo="INTERVENCION",
+            accion="LIBERAR",
+            entidad_afectada="cupos_liberados",
+            direccion_ip=ip,
+            id_usuario=usuario.id_usuario,
+            id_entidad=id_cupo_generado,
+            datos_before={"estado_cita": estado_cita_anterior},
+            datos_after={
+                "id_cita_origen": cita.id_cita,
+                "id_intervencion": intervencion.id_intervencion,
+                "id_cupo_liberado": id_cupo_generado,
+                "estado_cita": "LIBERADA",
+                "estado_cupo": "DISPONIBLE",
+                "origen_liberacion": "INTERVENCION_VOLUNTARIA",
+            },
+        )
+
+    # Caso 3: SIN_RESPUESTA o SOLICITA_REPROG -> Prohibición estricta de cancelación/liberación unilateral (RN02 / RF-067)
+    elif datos.respuesta_paciente in ("SIN_RESPUESTA", "SOLICITA_REPROG"):
+        pass
+
+    registrar_evento(
+        db,
+        modulo="INTERVENCION",
+        accion="UPDATE",
+        entidad_afectada="intervenciones",
+        direccion_ip=ip,
+        id_usuario=usuario.id_usuario,
+        id_entidad=intervencion.id_intervencion,
+        datos_before=antes_intervencion,
+        datos_after={
+            "estado_intervencion": intervencion.estado_intervencion,
+            "respuesta_paciente": intervencion.respuesta_paciente,
+            "consentimiento_optout": intervencion.consentimiento_optout,
+            "estado_cita": cita.estado_actual,
+            "id_cupo_liberado": id_cupo_generado,
+        },
+    )
+    db.commit()
+    db.refresh(intervencion)
+    return _enriquecer_out(
+        intervencion,
+        estado_cita_actual=cita.estado_actual,
+        id_cupo_liberado=id_cupo_generado,
+    )
+
